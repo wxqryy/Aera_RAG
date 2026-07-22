@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Runtime data and model caches
+database.db
+*.sqlite
+*.sqlite3
+faiss_index
+faiss_index.*
+.cache/
+huggingface/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

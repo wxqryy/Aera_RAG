@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import faiss
 import sqlite3
+import os
 from transformers import AutoTokenizer, AutoModelForCausalLM, BatchEncoding
 import torch.nn.functional as F
 from transformers import AutoModel, BitsAndBytesConfig
@@ -9,6 +10,11 @@ import time
 
 
 app = Flask(__name__)
+
+MODEL_ID = os.getenv('MODEL_ID', 'Qwen/Qwen2.5-7B-Instruct')
+EMBEDDING_MODEL_ID = os.getenv('EMBEDDING_MODEL_ID', 'intfloat/multilingual-e5-large')
+INDEX_PATH = os.getenv('FAISS_INDEX_PATH', 'faiss_index')
+DATABASE_PATH = os.getenv('MOVIE_DATABASE_PATH', 'database.db')
 
 quantization_config_4bit = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -19,14 +25,16 @@ quantization_config_4bit = BitsAndBytesConfig(
 
 class AIModel:
     def __init__(self):
-        self.qwen = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct", quantization_config=quantization_config_4bit, device_map={"": 0})
-        self.processor = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct", use_fast=True)
+        if not torch.cuda.is_available():
+            raise RuntimeError('A CUDA-capable NVIDIA GPU is required for 4-bit inference.')
+        self.device = torch.device('cuda')
+        self.db_path = DATABASE_PATH
+        self.qwen = AutoModelForCausalLM.from_pretrained(MODEL_ID, quantization_config=quantization_config_4bit, device_map={"": 0})
+        self.processor = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
         print("Модель загружена успешно!")
-        index_path = 'faiss_index'
-        self.index = self.load_faiss_index(index_path)
-        self.tokenizer = AutoTokenizer.from_pretrained('intfloat/multilingual-e5-large', use_fast=True)
-        self.model = AutoModel.from_pretrained('intfloat/multilingual-e5-large', quantization_config=quantization_config_4bit, device_map={"": 0})
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.index = self.load_faiss_index(INDEX_PATH)
+        self.tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_ID, use_fast=True)
+        self.model = AutoModel.from_pretrained(EMBEDDING_MODEL_ID, quantization_config=quantization_config_4bit, device_map={"": 0})
         self.model.eval()
         print("Модель и токенайзер загружены.")
         self.rewrite_prompt = [{"role": "system", "content": """Ты — киноассистент, который помогает формулировать запросы для поиска фильмов и анализа кинематографа.
@@ -48,7 +56,7 @@ class AIModel:
               **Ответ:** "Похожи ли фильмы Звёздные войны и Стражи Галактики"
             """}]
         rewrite_text = self.processor.apply_chat_template(self.rewrite_prompt, tokenize=False, add_generation_prompt=False)
-        self.rewrite_tokens = self.processor(text=rewrite_text,return_tensors="pt").to("cuda")
+        self.rewrite_tokens = self.processor(text=rewrite_text,return_tensors="pt").to(self.device)
         self.answer_prompt = [{"role": "system", "content": """Ты — умный киноассистент, который помогает пользователям находить фильмы и отвечать на вопросы о кино. Отвечай только на русском.
 Ты умеешь **подбирать фильмы по запросу** и **отвечать на вопросы**, используя доступную информацию.
 - **НИКОГДА НЕ УКАЗЫВАЙ РЕЙТИНГ ФИЛЬМА В ОТВЕТЕ!**
@@ -105,7 +113,7 @@ class AIModel:
 - **НИКОГДА НЕ УКАЗЫВАЙ РЕЙТИНГ ФИЛЬМА В ОТВЕТЕ!**
         """}]
         answer_text = self.processor.apply_chat_template(self.answer_prompt, tokenize=False, add_generation_prompt=False)
-        self.answer_tokens = self.processor(text=answer_text,return_tensors="pt").to("cuda")
+        self.answer_tokens = self.processor(text=answer_text,return_tensors="pt").to(self.device)
         print("Инструкции кешированы")
 
     rating_weight = 0.8
@@ -145,8 +153,8 @@ class AIModel:
         movie_scores.sort(reverse=True, key=lambda x: x[0])
         return movie_scores
 
-    def get_movie_info(self, movie_id, distance, db_path='database.db', table_name='data'):
-        conn = sqlite3.connect(db_path)
+    def get_movie_info(self, movie_id, distance, db_path=None, table_name='data'):
+        conn = sqlite3.connect(db_path or self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         movie_id = int(movie_id)
@@ -196,7 +204,7 @@ class AIModel:
         user_input = data
         new_message = [{"role": "user", "content": user_input}]
         new_text = self.processor.apply_chat_template(new_message,tokenize=False,add_generation_prompt=True)
-        new_tokens = self.processor(text=new_text,return_tensors="pt").to("cuda")
+        new_tokens = self.processor(text=new_text,return_tensors="pt").to(self.device)
         input_ids = torch.cat([self.rewrite_tokens["input_ids"], new_tokens["input_ids"]], dim=-1)
         attention_mask = torch.cat([self.rewrite_tokens["attention_mask"], new_tokens["attention_mask"]], dim=-1)
         inputs = BatchEncoding({"input_ids": input_ids,"attention_mask": attention_mask})
@@ -209,7 +217,7 @@ class AIModel:
         formatted_movies = self.format_movies_for_prompt([movie[1]["id"] for movie in sorted_movies])
         new_message = [{"role": "user", "content": f'''{formatted_movies}.\n{user_input}'''}]
         new_text = self.processor.apply_chat_template(new_message,tokenize=False,add_generation_prompt=True)
-        new_tokens = self.processor(text=new_text,return_tensors="pt").to("cuda")
+        new_tokens = self.processor(text=new_text,return_tensors="pt").to(self.device)
         input_ids = torch.cat([self.answer_tokens["input_ids"], new_tokens["input_ids"]], dim=-1)
         attention_mask = torch.cat([self.answer_tokens["attention_mask"], new_tokens["attention_mask"]], dim=-1)
         inputs = BatchEncoding({"input_ids": input_ids,"attention_mask": attention_mask})
@@ -239,4 +247,9 @@ def process():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, threaded=True, debug=False)
+    app.run(
+        host=os.getenv('HOST', '127.0.0.1'),
+        port=int(os.getenv('PORT', '5001')),
+        threaded=True,
+        debug=False,
+    )
